@@ -1,0 +1,6 @@
+{
+  "name": "Trình Dịch Sách AI",
+  "description": "Dịch sách PDF thông minh sử dụng Gemini AI, giữ nguyên cấu trúc và trải nghiệm đọc mượt mà.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
