@@ -52,6 +52,18 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState(0);
   const [isAutoTranslating, setIsAutoTranslating] = useState(true);
   const [savedBooks, setSavedBooks] = useState<SavedBook[]>([]);
+
+  const updateSavedBooksState = (books: SavedBook[]) => {
+    const seen = new Set<string>();
+    const unique = books.filter(b => {
+      if (!b || !b.id) return false;
+      if (seen.has(b.id)) return false;
+      seen.add(b.id);
+      return true;
+    });
+    setSavedBooks(unique);
+  };
+
   const [isSaving, setIsSaving] = useState(false);
   const [activeTranslations, setActiveTranslations] = useState(0);
   const [currentBookId, setCurrentBookId] = useState<string | null>(null);
@@ -82,7 +94,7 @@ export default function App() {
     const loadBooksFromStorage = async () => {
       try {
         const books = await getAllBooks();
-        setSavedBooks(books.sort((a, b) => b.timestamp - a.timestamp));
+        updateSavedBooksState(books.sort((a, b) => b.timestamp - a.timestamp));
       } catch (err) {
         console.error("Failed to load library", err);
       }
@@ -143,8 +155,9 @@ export default function App() {
     if (!file || pages.length === 0) return;
     setIsSaving(true);
     try {
+      const generateId = currentBookId || `${file.name}-${Date.now()}`;
       const bookToSave: SavedBook = {
-        id: `${file.name}-${Date.now()}`,
+        id: generateId,
         name: file.name,
         pages: pages,
         targetLang: targetLang,
@@ -152,9 +165,10 @@ export default function App() {
         outline: bookOutline
       };
       await saveBook(bookToSave);
+      setCurrentBookId(generateId);
       // Refresh list
       const books = await getAllBooks();
-      setSavedBooks(books.sort((a, b) => b.timestamp - a.timestamp));
+      updateSavedBooksState(books.sort((a, b) => b.timestamp - a.timestamp));
       triggerNotification("Đã lưu vào thư viện thành công!", 'success');
     } catch (err) {
       console.error("Save failed", err);
@@ -193,7 +207,7 @@ export default function App() {
       console.log("Book deleted from storage successfully in background:", id);
       
       const books = await getAllBooks();
-      setSavedBooks(books.sort((a, b) => b.timestamp - a.timestamp));
+      updateSavedBooksState(books.sort((a, b) => b.timestamp - a.timestamp));
       
       if (currentBookId === id) {
         setCurrentBookId(null);
