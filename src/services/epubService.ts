@@ -1,11 +1,16 @@
 import JSZip from "jszip";
+import { BookmarkItem } from "./storageService";
 
 /**
  * Generates an EPUB file from book pages.
  * EPUB is the modern standard for ebooks, supported by Kindle and most e-readers.
  * Traditionally, PRC/MOBI was used for Kindle, but Amazon has shifted to EPUB.
  */
-export async function exportToEpub(title: string, pages: { translatedText?: string; text: string }[]) {
+export async function exportToEpub(
+  title: string, 
+  pages: { translatedText?: string; text: string }[],
+  outline?: BookmarkItem[]
+) {
   const zip = new JSZip();
 
   // 1. Mimetype (must be the first file and uncompressed)
@@ -41,11 +46,9 @@ export async function exportToEpub(title: string, pages: { translatedText?: stri
   <title>${title} - Page ${i + 1}</title>
   <style>
     body { font-family: sans-serif; padding: 1em; line-height: 1.5; }
-    h1 { font-size: 1.2em; border-bottom: 1px solid #ccc; padding-bottom: 0.5em; }
   </style>
 </head>
 <body>
-  <h1>${title} - Trang ${i + 1}</h1>
   <div class="content">
     ${escapedContent}
   </div>
@@ -78,11 +81,31 @@ export async function exportToEpub(title: string, pages: { translatedText?: stri
 
   // 5. TOC.ncx (for navigation)
   let navPoints = "";
-  for (let i = 0; i < pages.length; i++) {
-    navPoints += `<navPoint id="navPoint-${i + 1}" playOrder="${i + 1}">
-      <navLabel><text>Trang ${i + 1}</text></navLabel>
-      <content src="page_${i + 1}.xhtml"/>
-    </navPoint>\n`;
+  if (outline && outline.length > 0) {
+    let playOrder = 1;
+    const traverse = (items: BookmarkItem[]): string => {
+      let xml = "";
+      for (const item of items) {
+        const pOrder = playOrder++;
+        const targetPage = Math.min(Math.max(1, item.pageNumber), pages.length);
+        xml += `<navPoint id="navPoint-${pOrder}" playOrder="${pOrder}">
+          <navLabel><text>${item.title}</text></navLabel>
+          <content src="page_${targetPage}.xhtml"/>`;
+        if (item.items && item.items.length > 0) {
+          xml += "\n" + traverse(item.items);
+        }
+        xml += `</navPoint>\n`;
+      }
+      return xml;
+    };
+    navPoints = traverse(outline);
+  } else {
+    for (let i = 0; i < pages.length; i++) {
+      navPoints += `<navPoint id="navPoint-${i + 1}" playOrder="${i + 1}">
+        <navLabel><text>Trang ${i + 1}</text></navLabel>
+        <content src="page_${i + 1}.xhtml"/>
+      </navPoint>\n`;
+    }
   }
 
   const ncx = `<?xml version="1.0" encoding="utf-8"?>

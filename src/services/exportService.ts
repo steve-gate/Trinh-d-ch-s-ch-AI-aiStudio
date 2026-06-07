@@ -1,7 +1,12 @@
 import { jsPDF } from "jspdf";
 import html2canvas from "html2canvas";
+import { BookmarkItem } from "./storageService";
 
-export async function exportToPdf(title: string, pages: { translatedText?: string; text: string }[]) {
+export async function exportToPdf(
+  title: string, 
+  pages: { translatedText?: string; text: string }[],
+  outline?: BookmarkItem[]
+) {
   const doc = new jsPDF({
     orientation: 'p',
     unit: 'mm',
@@ -33,16 +38,6 @@ export async function exportToPdf(title: string, pages: { translatedText?: strin
 
         // Clear and prepare content for this page
         container.innerHTML = '';
-        
-        // Header
-        const header = document.createElement('div');
-        header.style.fontSize = '8pt';
-        header.style.color = '#999999';
-        header.style.borderBottom = '1px solid #eeeeee';
-        header.style.marginBottom = '10mm';
-        header.style.paddingBottom = '2mm';
-        header.innerText = `${title} - Trang ${i + 1}`;
-        container.appendChild(header);
 
         // Body
         const body = document.createElement('div');
@@ -70,6 +65,22 @@ export async function exportToPdf(title: string, pages: { translatedText?: strin
         const finalHeight = imgHeight * ratio;
 
         doc.addImage(imgData, 'JPEG', margin, margin, finalWidth, finalHeight);
+    }
+
+    if (outline && outline.length > 0) {
+      try {
+        const addPdfOutline = (items: BookmarkItem[], parentNode: any = null) => {
+          for (const item of items) {
+            const node = doc.outline.add(parentNode, item.title, { pageNumber: item.pageNumber });
+            if (item.items && item.items.length > 0) {
+              addPdfOutline(item.items, node);
+            }
+          }
+        };
+        addPdfOutline(outline);
+      } catch (err) {
+        console.warn("Could not generate PDF bookmarks", err);
+      }
     }
 
     doc.save(`${title.replace(/\.[^/.]+$/, "")}_translated.pdf`);

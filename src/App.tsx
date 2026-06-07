@@ -18,15 +18,16 @@ import {
   CheckCircle2,
   XCircle,
   AlertCircle,
+  AlertTriangle,
   Library as LibraryIcon,
   Trash2,
   Save,
   Clock,
   Type
 } from 'lucide-react';
-import { extractTextFromPdf, PageContent } from './services/pdfService.ts';
+import { extractTextFromPdf, PageContent, extractOutlineFromPdf, generateFallbackOutline } from './services/pdfService.ts';
 import { translateText } from './services/geminiService.ts';
-import { saveBook, getAllBooks, deleteBook, SavedBook, clearAllBooks } from './services/storageService.ts';
+import { saveBook, getAllBooks, deleteBook, SavedBook, clearAllBooks, BookmarkItem } from './services/storageService.ts';
 import { exportToPdf } from './services/exportService.ts';
 import { exportToEpub, exportToTxt } from './services/epubService.ts';
 
@@ -43,6 +44,10 @@ export default function App() {
   const [state, setState] = useState<AppState>('upload');
   const [file, setFile] = useState<File | null>(null);
   const [pages, setPages] = useState<TranslatedPage[]>([]);
+  const pagesRef = useRef<TranslatedPage[]>(pages);
+  useEffect(() => {
+    pagesRef.current = pages;
+  }, [pages]);
   const [targetLang, setTargetLang] = useState('Tiếng Việt');
   const [currentPage, setCurrentPage] = useState(0);
   const [isAutoTranslating, setIsAutoTranslating] = useState(true);
@@ -55,8 +60,13 @@ export default function App() {
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [editingText, setEditingText] = useState("");
   const [notification, setNotification] = useState<{message: string, type: 'error' | 'success' | 'info', index?: number} | null>(null);
+  const [workerTrigger, setWorkerTrigger] = useState(0);
+  const [bookOutline, setBookOutline] = useState<BookmarkItem[]>([]);
+  const [isOutlineOpen, setIsOutlineOpen] = useState(false);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [showClearConfirm, setShowClearConfirm] = useState<boolean>(false);
 
-  const translatedCount = pages.filter(p => p.translatedText).length;
+  const translatedCount = pages.filter(p => p.translatedText && p.translatedText !== "Dịch thuật thất bại." && p.translatedText.trim() !== "").length;
   const overallProgress = pages.length > 0 ? (translatedCount / pages.length) * 100 : 0;
 
   const translateQueueRef = useRef<number[]>([]);
@@ -68,6 +78,7 @@ export default function App() {
 
   // Load saved books
   useEffect(() => {
+    if (state !== 'library') return;
     const loadBooksFromStorage = async () => {
       try {
         const books = await getAllBooks();
@@ -89,6 +100,14 @@ export default function App() {
       try {
         const extractedPages = await extractTextFromPdf(selectedFile);
         setPages(extractedPages.map(p => ({ ...p, isTranslating: false })));
+        
+        // Extract standard outline or fallback automatically to chapter detection
+        let outline = await extractOutlineFromPdf(selectedFile);
+        if (!outline || outline.length === 0) {
+          outline = generateFallbackOutline(extractedPages);
+        }
+        setBookOutline(outline);
+
         setState('reader');
         setCurrentPage(0);
       } catch (err) {
@@ -104,11 +123,12 @@ export default function App() {
   const handleExport = async (format: 'pdf' | 'epub' | 'txt', bookToExport?: SavedBook) => {
     const title = bookToExport ? bookToExport.name : (file?.name || "translated_book");
     const pagesToExport = bookToExport ? bookToExport.pages : pages;
+    const outlineToExport = bookToExport ? (bookToExport.outline || []) : bookOutline;
     
     setIsExporting(format);
     try {
-      if (format === 'pdf') await exportToPdf(title, pagesToExport);
-      else if (format === 'epub') await exportToEpub(title, pagesToExport);
+      if (format === 'pdf') await exportToPdf(title, pagesToExport, outlineToExport);
+      else if (format === 'epub') await exportToEpub(title, pagesToExport, outlineToExport);
       else if (format === 'txt') await exportToTxt(title, pagesToExport);
       triggerNotification(`Đã xuất file ${format.toUpperCase()} thành công!`, 'success');
     } catch (err) {
@@ -128,7 +148,8 @@ export default function App() {
         name: file.name,
         pages: pages,
         targetLang: targetLang,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        outline: bookOutline
       };
       await saveBook(bookToSave);
       // Refresh list
@@ -147,6 +168,7 @@ export default function App() {
     setCurrentBookId(book.id);
     setPages(book.pages);
     setTargetLang(book.targetLang);
+    setBookOutline(book.outline || []);
     setFile({ name: book.name } as File); // Partial mock file
     setState('reader');
     setViewMode('split');
@@ -154,54 +176,67 @@ export default function App() {
     triggerNotification(`Đã mở: ${book.name}`, 'info');
   };
 
-  const handleDeleteBook = async (id: string | null, e: React.MouseEvent) => {
+  const handleDeleteBook = (id: string | null, e: React.MouseEvent) => {
     if (!id) return;
     e.preventDefault();
     e.stopPropagation();
-    
-    console.log("Attempting to delete book:", id);
-    
-    if (window.confirm("Bạn có chắc chắn muốn xóa sách này khỏi thư viện?")) {
-      try {
-        await deleteBook(id);
-        console.log("Book deleted from storage:", id);
-        setSavedBooks(prev => prev.filter(b => b.id !== id));
-        
-        if (currentBookId === id) {
-          setCurrentBookId(null);
-          setPages([]);
-          setFile(null);
-          setState('library');
-        }
-        triggerNotification("Đã xóa sách khỏi thư viện", 'info');
-      } catch (err) {
-        console.error("Delete failed", err);
-        triggerNotification("Không thể xóa sách. Vui lòng thử lại.", 'error');
+    console.log("Setting delete confirm for book:", id);
+    setDeleteConfirmId(id);
+  };
+
+  const confirmDeleteBook = async () => {
+    if (!deleteConfirmId) return;
+    const id = deleteConfirmId;
+    setDeleteConfirmId(null);
+    try {
+      await deleteBook(id);
+      console.log("Book deleted from storage successfully in background:", id);
+      
+      const books = await getAllBooks();
+      setSavedBooks(books.sort((a, b) => b.timestamp - a.timestamp));
+      
+      if (currentBookId === id) {
+        setCurrentBookId(null);
+        setPages([]);
+        setFile(null);
+        setState('library');
       }
+      triggerNotification("Đã xóa sách khỏi thư viện", 'info');
+    } catch (err) {
+      console.error("Delete failed", err);
+      triggerNotification("Không thể xóa sách. Vui lòng thử lại.", 'error');
     }
   };
 
-  const handleClearLibrary = async () => {
-    if (confirm("Cảnh báo: Bạn có chắc chắn muốn xóa TOÀN BỘ dữ liệu (sách dịch, thư viện, cài đặt)? Hành động này sẽ xóa vĩnh viễn dữ liệu trong trình duyệt của bạn và đưa ứng dụng về trạng thái ban đầu.")) {
-      try {
-        await clearAllBooks();
-        localStorage.clear(); 
-        setSavedBooks([]);
-        setPages([]);
-        setFile(null);
-        setCurrentBookId(null);
-        setState('upload');
-        triggerNotification("Đã đặt lại toàn bộ ứng dụng", 'success');
-      } catch (err) {
-        console.error("Clear storage failed", err);
-        triggerNotification("Có lỗi xảy ra khi xóa dữ liệu.", 'error');
-      }
+  const handleClearLibrary = () => {
+    setShowClearConfirm(true);
+  };
+
+  const confirmClearLibrary = async () => {
+    setShowClearConfirm(false);
+    try {
+      await clearAllBooks();
+      localStorage.clear(); 
+      setSavedBooks([]);
+      setPages([]);
+      setFile(null);
+      setCurrentBookId(null);
+      setState('upload');
+      triggerNotification("Đã đặt lại toàn bộ ứng dụng thành công!", 'success');
+      
+      // Force page reload to safely clear active worker hooks and release blocked IndexedDB handles
+      setTimeout(() => {
+        window.location.reload();
+      }, 500);
+    } catch (err) {
+      console.error("Clear storage failed", err);
+      triggerNotification("Có lỗi xảy ra khi xóa dữ liệu.", 'error');
     }
   };
 
   const retryAllErrors = () => {
     const errorIndices = pages
-      .map((p, i) => p.error ? i : -1)
+      .map((p, i) => (p.error || p.translatedText === "Dịch thuật thất bại.") ? i : -1)
       .filter(i => i !== -1);
     
     if (errorIndices.length === 0) {
@@ -209,13 +244,15 @@ export default function App() {
       return;
     }
 
-    setPages(prev => prev.map((p, i) => errorIndices.includes(i) ? { ...p, error: undefined } : p));
+    setPages(prev => prev.map((p, i) => errorIndices.includes(i) ? { ...p, translatedText: undefined, error: undefined, isTranslating: true } : p));
     translateQueueRef.current = [...new Set([...translateQueueRef.current, ...errorIndices])];
+    setWorkerTrigger(prev => prev + 1);
   };
 
   const regeneratePage = (index: number) => {
     setPages(prev => prev.map((p, i) => i === index ? { ...p, translatedText: undefined, error: undefined, isTranslating: true } : p));
     translateQueueRef.current.push(index);
+    setWorkerTrigger(prev => prev + 1);
   };
 
   const startEditing = (index: number) => {
@@ -239,84 +276,158 @@ export default function App() {
     }
   }, [notification]);
 
-  // Translation worker
+  // Re-prioritize page translation queue when viewport/pages change
   useEffect(() => {
-    if (state !== 'reader') return;
+    if (state !== 'reader' || !isAutoTranslating) return;
 
-    const processQueue = async () => {
-      // Allow up to 2 concurrent translations to speed up without hitting limits too hard
-      if (isCurrentlyTranslatingRef.current >= 2 || translateQueueRef.current.length === 0) return;
+    // Find pages needing translation using latest pages value
+    const untranslatedIndices = pages
+      .map((p, i) => {
+        const hasValidTranslation = p.translatedText && 
+                                    p.translatedText !== "Dịch thuật thất bại." && 
+                                    p.translatedText.trim() !== "";
+        return (!hasValidTranslation && !p.isTranslating && !p.error) ? i : -1;
+      })
+      .filter(i => i !== -1);
+    
+    if (untranslatedIndices.length > 0) {
+      // Prioritize pages surrounding the user's current page (viewport)
+      const sortedIndices = [...untranslatedIndices].sort((a, b) => {
+        const distA = Math.abs(a - currentPage);
+        const distB = Math.abs(b - currentPage);
+        return distA - distB;
+      });
 
-      isCurrentlyTranslatingRef.current += 1;
-      setActiveTranslations(prev => prev + 1);
-      
-      const pageIndex = translateQueueRef.current.shift()!;
-      
-      setPages(prev => prev.map((p, idx) => idx === pageIndex ? { ...p, isTranslating: true } : p));
+      translateQueueRef.current = sortedIndices;
+    } else {
+      translateQueueRef.current = [];
+    }
+  }, [state, pages, currentPage, isAutoTranslating]);
 
-      const textToTranslate = pages[pageIndex].text;
-      if (textToTranslate) {
-        try {
-          const result = await translateText(textToTranslate, targetLang);
-          setPages(prev => prev.map((p, idx) => idx === pageIndex ? { 
-            ...p, 
-            translatedText: result, 
-            isTranslating: false 
-          } : p));
-        } catch (err: any) {
-          const isQuotaExceeded = err?.message?.includes("429") || 
-                                  err?.message?.includes("RESOURCE_EXHAUSTED") ||
-                                  err?.message?.includes("Quota exceeded");
+  // Background translation worker loop
+  useEffect(() => {
+    if (state !== 'reader' || !isAutoTranslating) {
+      setActiveTranslations(0);
+      isCurrentlyTranslatingRef.current = 0;
+      return;
+    }
 
-          setPages(prev => prev.map((p, idx) => idx === pageIndex ? { 
-            ...p, 
-            error: isQuotaExceeded ? "Hết hạn mức API" : "Lỗi dịch thuật", 
-            isTranslating: false 
-          } : p));
+    let active = true;
 
-          if (isQuotaExceeded) {
-            triggerNotification("Hết hạn mức API (Quota exceeded). Vui lòng đợi một lát hoặc thử lại sau.", 'error');
-            setIsAutoTranslating(false); // Stop auto-translation to prevent further errors
-          } else {
-            triggerNotification(`Gặp lỗi khi dịch trang ${pageIndex + 1}.`, 'error', pageIndex);
-          }
+    const runWorker = async () => {
+      while (active) {
+        // Safe concurrency limit
+        if (isCurrentlyTranslatingRef.current >= 2 || translateQueueRef.current.length === 0) {
+          // Worker stays alive but sleeps/yields for 800ms if idle or waiting
+          await new Promise(resolve => setTimeout(resolve, 800));
+          continue;
         }
-      } else {
-         setPages(prev => prev.map((p, idx) => idx === pageIndex ? { 
-            ...p, 
-            translatedText: "(Trang trống)", 
-            isTranslating: false 
-          } : p));
-      }
 
-      isCurrentlyTranslatingRef.current -= 1;
-      setActiveTranslations(prev => prev - 1);
-      
-      // Proactive delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 800));
-      processQueue();
-    };
-
-    if (isAutoTranslating) {
-      const untranslatedIndices = pages
-        .map((p, i) => (!p.translatedText && !p.isTranslating && !p.error) ? i : -1)
-        .filter(i => i !== -1);
-      
-      if (untranslatedIndices.length > 0) {
-        // Prioritize current page surroundings
-        const sortedIndices = [...untranslatedIndices].sort((a, b) => {
-          const distA = Math.abs(a - currentPage);
-          const distB = Math.abs(b - currentPage);
-          return distA - distB;
+        const pageIndex = translateQueueRef.current.find(idx => {
+          const p = pagesRef.current[idx];
+          const hasValidTranslation = p && 
+                                      p.translatedText && 
+                                      p.translatedText !== "Dịch thuật thất bại." && 
+                                      p.translatedText.trim() !== "";
+          return p && !hasValidTranslation && !p.isTranslating && !p.error;
         });
 
-        translateQueueRef.current = sortedIndices;
-        // Start workers
-        processQueue();
-        if (sortedIndices.length > 1) processQueue(); // Start second worker
+        if (pageIndex === undefined) {
+          await new Promise(resolve => setTimeout(resolve, 800));
+          continue;
+        }
+
+        // Remove pageIndex from the queue so other workers don't pick it up
+        translateQueueRef.current = translateQueueRef.current.filter(idx => idx !== pageIndex);
+
+        // Fetch up-to-date page state from pagesRef to avoid stale closure of pages list
+        const latestPage = pagesRef.current[pageIndex];
+        if (!latestPage) {
+          continue;
+        }
+
+        isCurrentlyTranslatingRef.current += 1;
+        setActiveTranslations(prev => prev + 1);
+
+        setPages(prev => prev.map((p, idx) => idx === pageIndex ? { ...p, isTranslating: true } : p));
+
+        const textToTranslate = latestPage.text;
+        if (textToTranslate) {
+          try {
+            const result = await translateText(textToTranslate, targetLang);
+            if (!active) {
+              isCurrentlyTranslatingRef.current = Math.max(0, isCurrentlyTranslatingRef.current - 1);
+              setActiveTranslations(prev => Math.max(0, prev - 1));
+              return;
+            }
+
+            setPages(prev => prev.map((p, idx) => idx === pageIndex ? { 
+              ...p, 
+              translatedText: result, 
+              isTranslating: false,
+              error: undefined
+            } : p));
+          } catch (err: any) {
+            if (!active) {
+              isCurrentlyTranslatingRef.current = Math.max(0, isCurrentlyTranslatingRef.current - 1);
+              setActiveTranslations(prev => Math.max(0, prev - 1));
+              return;
+            }
+
+            const isQuotaExceeded = err?.message?.includes("429") || 
+                                    err?.message?.includes("RESOURCE_EXHAUSTED") ||
+                                    err?.message?.includes("Quota exceeded") ||
+                                    err?.status === "RESOURCE_EXHAUSTED";
+
+            setPages(prev => prev.map((p, idx) => idx === pageIndex ? { 
+              ...p, 
+              error: isQuotaExceeded ? "Hết hạn mức API" : "Lỗi dịch thuật", 
+              isTranslating: false,
+              translatedText: undefined
+            } : p));
+
+            if (isQuotaExceeded) {
+              triggerNotification("Hết hạn mức API (Quota exceeded). Vui lòng đợi một lát hoặc thử lại sau.", 'error');
+              setIsAutoTranslating(false); // Stop auto-translation to prevent further errors
+              isCurrentlyTranslatingRef.current = Math.max(0, isCurrentlyTranslatingRef.current - 1);
+              setActiveTranslations(prev => Math.max(0, prev - 1));
+              break; // Break active worker loop
+            } else {
+              triggerNotification(`Gặp lỗi khi dịch trang ${pageIndex + 1}.`, 'error', pageIndex);
+            }
+          }
+        } else {
+          if (active) {
+            setPages(prev => prev.map((p, idx) => idx === pageIndex ? { 
+              ...p, 
+              translatedText: "(Trang trống)", 
+              isTranslating: false 
+            } : p));
+          }
+        }
+
+        isCurrentlyTranslatingRef.current = Math.max(0, isCurrentlyTranslatingRef.current - 1);
+        setActiveTranslations(prev => Math.max(0, prev - 1));
+
+        // Polite pause between pages on each thread
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
-    }
-  }, [state, pages, currentPage, isAutoTranslating, targetLang]);
+    };
+
+    // Reset tracking count for fresh worker instance
+    isCurrentlyTranslatingRef.current = 0;
+    setActiveTranslations(0);
+
+    // Run 2 parallel workspace workers
+    runWorker();
+    setTimeout(() => {
+      if (active) runWorker();
+    }, 200);
+
+    return () => {
+      active = false;
+    };
+  }, [state, isAutoTranslating, targetLang, workerTrigger]);
 
   const goToNextPage = () => {
     if (currentPage < pages.length - 1) setCurrentPage(prev => prev + 1);
@@ -550,17 +661,21 @@ export default function App() {
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {savedBooks.map((book) => {
-                    const translatedCount = book.pages.filter(p => p.translatedText).length;
-                    const bookProgress = Math.round((translatedCount / book.pages.length) * 100);
-                    
-                    return (
-                      <motion.div 
-                        key={book.id}
-                        layoutId={book.id}
-                        onClick={() => loadSavedBook(book)}
-                        className="p-6 bg-white border border-black/5 rounded-2xl book-shadow cursor-pointer hover:border-[var(--color-accent)]/30 group transition-all"
-                      >
+                  <AnimatePresence mode="popLayout">
+                    {savedBooks.map((book) => {
+                      const translatedCount = book.pages.filter(p => p.translatedText && p.translatedText !== "Dịch thuật thất bại." && p.translatedText.trim() !== "").length;
+                      const bookProgress = Math.round((translatedCount / book.pages.length) * 100);
+                      
+                      return (
+                        <motion.div 
+                          key={book.id}
+                          initial={{ opacity: 0, y: 15 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, scale: 0.93, y: 10 }}
+                          transition={{ duration: 0.25, ease: "easeInOut" }}
+                          onClick={() => loadSavedBook(book)}
+                          className="p-6 bg-white border border-black/5 rounded-2xl book-shadow cursor-pointer hover:border-[var(--color-accent)]/30 group transition-colors duration-200"
+                        >
                         <div className="flex items-start justify-between mb-4">
                           <div className="w-10 h-10 bg-black/5 rounded-lg flex items-center justify-center text-black/40 group-hover:bg-[var(--color-accent)]/10 group-hover:text-[var(--color-accent)] transition-colors">
                             <FileText size={20} />
@@ -618,6 +733,7 @@ export default function App() {
                       </motion.div>
                     );
                   })}
+                  </AnimatePresence>
                 </div>
               )}
             </motion.div>
@@ -677,6 +793,55 @@ export default function App() {
                     <Type size={14} />
                     <span className="hidden sm:inline">{viewMode === 'split' ? 'Chế độ đọc' : 'Chế độ mặc định'}</span>
                   </button>
+
+                  <div className="relative">
+                    <button
+                      onClick={() => setIsOutlineOpen(!isOutlineOpen)}
+                      className={`flex items-center gap-2 text-xs font-bold uppercase tracking-wider transition-colors ${isOutlineOpen ? 'text-[var(--color-accent)]' : 'opacity-40 hover:opacity-100'}`}
+                      title="Mục lục sách"
+                    >
+                      <BookOpen size={14} />
+                      <span className="hidden sm:inline">Mục lục</span>
+                    </button>
+                    
+                    {isOutlineOpen && (
+                      <motion.div 
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="absolute top-full left-0 mt-2 w-72 bg-white border border-black/10 shadow-2xl rounded-2xl p-4 z-[100]"
+                      >
+                        <h4 className="text-xs font-bold uppercase tracking-wider mb-3 opacity-60">Mục lục sách</h4>
+                        <div className="max-h-64 overflow-y-auto space-y-1 pr-1 outline-none">
+                          {bookOutline.length > 0 ? (
+                            (() => {
+                              const renderOutlineItems = (items: BookmarkItem[], depth = 0) => {
+                                return items.map((item, idx) => (
+                                  <div key={`${depth}-${idx}`} className="space-y-1">
+                                    <button
+                                      onClick={() => {
+                                        const targetIdx = Math.min(Math.max(1, item.pageNumber), pages.length) - 1;
+                                        setCurrentPage(targetIdx);
+                                        setIsOutlineOpen(false);
+                                      }}
+                                      style={{ paddingLeft: `${depth * 12 + 8}px` }}
+                                      className="w-full text-left py-1.5 px-2 hover:bg-black/5 rounded-lg text-xs font-medium transition-colors flex items-center justify-between group"
+                                    >
+                                      <span className="truncate group-hover:text-[var(--color-accent)] transition-colors">{item.title}</span>
+                                      <span className="text-[10px] opacity-40 ml-2 shrink-0">Trang {item.pageNumber}</span>
+                                    </button>
+                                    {item.items && item.items.length > 0 && renderOutlineItems(item.items, depth + 1)}
+                                  </div>
+                                ));
+                              };
+                              return renderOutlineItems(bookOutline);
+                            })()
+                          ) : (
+                            <p className="text-center py-6 text-xs opacity-40 italic">Không tìm thấy mục lục</p>
+                          )}
+                        </div>
+                      </motion.div>
+                    )}
+                  </div>
                   
                   <div className="relative">
                     <button
@@ -863,7 +1028,7 @@ export default function App() {
                             <Loader2 className="animate-spin" size={32} />
                             <p className="text-sm font-medium">Đang dịch trang này...</p>
                           </motion.div>
-                        ) : pages[currentPage].translatedText ? (
+                        ) : (pages[currentPage].translatedText && pages[currentPage].translatedText !== "Dịch thuật thất bại.") ? (
                           <motion.div
                             key={`trans-${currentPage}`}
                             initial={{ opacity: 0, x: 10 }}
@@ -880,10 +1045,7 @@ export default function App() {
                             <XCircle size={32} />
                             <p className="text-sm font-medium">{pages[currentPage].error}</p>
                             <button 
-                              onClick={() => {
-                                translateQueueRef.current.push(currentPage);
-                                setPages(prev => prev.map((p, i) => i === currentPage ? { ...p, error: undefined } : p));
-                              }}
+                              onClick={() => regeneratePage(currentPage)}
                               className="text-xs uppercase font-bold tracking-widest border border-red-500/20 px-4 py-2 rounded-full hover:bg-red-500/5 transition-colors"
                             >
                               Thử lại
@@ -1008,6 +1170,93 @@ export default function App() {
               </div>
             </div>
           </motion.div>
+        )}
+
+        {/* Custom Confirm Delete Modal */}
+        {deleteConfirmId && (
+          <div className="fixed inset-0 z-[1000] flex items-center justify-center p-4">
+            {/* Backdrop */}
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setDeleteConfirmId(null)}
+              className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+            />
+            {/* Modal Panel */}
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="relative bg-white border border-black/5 rounded-2xl p-6 shadow-2xl max-w-sm w-full z-10"
+            >
+              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-red-50 text-red-600 mb-4 mx-auto">
+                <Trash2 size={24} />
+              </div>
+              <h3 className="text-lg font-bold text-gray-900 text-center mb-2">Xác nhận xóa sách</h3>
+              <p className="text-sm text-gray-500 text-center mb-6">
+                Bạn có chắc chắn muốn xóa sách này khỏi thư viện không? Hành động này không thể hoàn tác.
+              </p>
+              <div className="flex gap-3 justify-end">
+                <button
+                  onClick={() => setDeleteConfirmId(null)}
+                  className="flex-1 py-2.5 px-4 rounded-xl border border-black/5 text-gray-700 hover:bg-gray-50 transition-colors font-bold text-xs uppercase tracking-widest"
+                >
+                  Hủy
+                </button>
+                <button
+                  onClick={confirmDeleteBook}
+                  className="flex-1 py-2.5 px-4 rounded-xl bg-red-600 text-white hover:bg-red-700 transition-colors font-bold text-xs uppercase tracking-widest"
+                >
+                  Xóa sách
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {/* Custom Clear Library Modal */}
+        {showClearConfirm && (
+          <div className="fixed inset-0 z-[1000] flex items-center justify-center p-4">
+            {/* Backdrop */}
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowClearConfirm(false)}
+              className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+            />
+            {/* Modal Panel */}
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="relative bg-white border border-black/5 rounded-2xl p-6 shadow-2xl max-w-md w-full z-10"
+            >
+              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-red-100 text-red-600 mb-4 mx-auto animate-bounce">
+                <AlertTriangle size={24} />
+              </div>
+              <h3 className="text-lg font-bold text-gray-900 text-center mb-2 text-red-600 uppercase tracking-wide">Cảnh báo quan trọng</h3>
+              <p className="text-sm text-gray-500 text-center mb-6 leading-relaxed">
+                Bạn có chắc chắn muốn xóa <span className="font-bold text-gray-950">TOÀN BỘ</span> dữ liệu (sách dịch, thư viện, cài đặt)? <br/>
+                Hành động này sẽ xóa vĩnh viễn dữ liệu trong trình duyệt của bạn và đưa ứng dụng về trạng thái ban đầu.
+              </p>
+              <div className="flex gap-3 justify-end">
+                <button
+                  onClick={() => setShowClearConfirm(false)}
+                  className="flex-1 py-2.5 px-4 rounded-xl border border-black/5 text-gray-700 hover:bg-gray-50 transition-colors font-bold text-xs uppercase tracking-widest"
+                >
+                  Hủy
+                </button>
+                <button
+                  onClick={confirmClearLibrary}
+                  className="flex-1 py-2.5 px-4 rounded-xl bg-red-600 text-white hover:bg-red-700 transition-colors font-bold text-xs uppercase tracking-widest"
+                >
+                  Xóa toàn bộ
+                </button>
+              </div>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
     </div>

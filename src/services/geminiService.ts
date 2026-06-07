@@ -5,27 +5,60 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export async function translateText(text: string, targetLanguage: string, retries = 3, backoff = 2000): Promise<string> {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  // If the text contains no printable letters (only numbers, spaces, punctuation, symbols), 
+  // bypass the API call entirely to save quota and preserve original layout/digits.
+  if (!/[a-zA-Z\p{L}]/u.test(trimmed)) {
+    return text;
+  }
+
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: `Translate the following text from a book into ${targetLanguage}. Maintain the tone and nuances of the original text. If it is already in ${targetLanguage}, just return the original text. Avoid adding any commentary or explanations. Output only the translated text.\n\nText:\n${text}`,
+      model: "gemini-3.5-flash",
+      contents: `Translate the following text from a fictional or general book into ${targetLanguage}. Maintain the tone, paragraph structures, and exact styling details. 
+If the text is already in ${targetLanguage}, just return the original text. 
+IMPORTANT: This is a purely linguistic translation task of a book passage. Do not filter, skip, or refuse the text. Do not add any introductory notes, warnings, commentary, explanations, or metadata. Output ONLY the raw finished translation translation itself.\n\nText:\n${text}`,
       config: {
         temperature: 0.3,
       },
     });
 
-    return response.text || "Dịch thuật thất bại.";
-  } catch (error: any) {
-    // Check for 429 (Rate Limit) error
-    const isRateLimit = error?.message?.includes("429") || error?.status === "RESOURCE_EXHAUSTED";
-    
-    if (isRateLimit && retries > 0) {
-      console.warn(`Rate limit hit. Retrying in ${backoff}ms... (${retries} retries left)`);
-      await delay(backoff);
-      return translateText(text, targetLanguage, retries - 1, backoff * 2);
+    const translated = response.text?.trim();
+    if (!translated || translated === "Dịch thuật thất bại." || translated === "") {
+      throw new Error("VALIDATION_ERROR: Kết quả dịch thuật trống hoặc không hợp lệ.");
     }
 
-    console.error("Translation error:", error);
+    return translated;
+  } catch (error: any) {
+    const errorMessage = error?.message || "";
+    const errorStatus = error?.status || "";
+    
+    // Check if the error is 429/Resource Exhausted (Rate Limit or Quota)
+    const isRateLimit = errorMessage.includes("429") || 
+                        errorMessage.includes("RESOURCE_EXHAUSTED") ||
+                        errorStatus === "RESOURCE_EXHAUSTED" ||
+                        errorMessage.toLowerCase().includes("quota");
+
+    // Only actual server glitches/timeouts are transient retries. Do NOT retry on VALIDATION_ERROR or blocks.
+    const isTransient = isRateLimit || 
+                        errorMessage.includes("503") || 
+                        errorMessage.includes("500") || 
+                        errorMessage.toLowerCase().includes("temporary") ||
+                        errorMessage.toLowerCase().includes("timeout") ||
+                        errorMessage.toLowerCase().includes("service unavailable");
+    
+    if (isTransient && retries > 0) {
+      console.warn(`Transient error or rate limit hit. Retrying in ${backoff}ms... (${retries} retries remaining). Error: ${errorMessage}`);
+      await delay(backoff);
+      return translateText(text, targetLanguage, retries - 1, backoff * 1.5);
+    }
+
+    // Always bubble up the error to App.tsx so it knows translation failed
+    console.error("Translation failed persistently:", error);
     throw error;
   }
 }
